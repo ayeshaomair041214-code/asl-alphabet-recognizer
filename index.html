@@ -6,12 +6,16 @@
 <title>ASL Alphabet Recognizer</title>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@teachablemachine/image@0.8/dist/teachablemachine-image.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
 <style>
 body{font-family:Arial,sans-serif;background:#f5f1ff;color:#25213a;text-align:center;padding:20px}
 main{max-width:500px;margin:auto;background:white;padding:22px;border-radius:20px}
 button{background:#6845c5;color:white;border:0;border-radius:12px;padding:14px 22px;font-size:16px}
-#camera{margin:16px auto;max-width:320px}#camera canvas{width:100%!important;height:auto!important}
+button:disabled{opacity:.65}
+#camera{margin:16px auto;max-width:320px}
+#camera canvas{width:100%!important;height:auto!important}
 #letter{font-size:56px;color:#6845c5;font-weight:bold}
+#hint{font-size:14px;color:#625b78}
 </style>
 </head>
 <body><main>
@@ -21,25 +25,111 @@ button{background:#6845c5;color:white;border:0;border-radius:12px;padding:14px 2
 <div id="camera"></div>
 <p>Recognized letter</p><div id="letter">-</div><div id="confidence"></div>
 <p id="status">Press START CAMERA to begin.</p>
+<p id="hint">J: trace the J movement with your pinky. Z: trace a Z with your index finger.</p>
 </main>
 <script>
 const URL="https://teachablemachine.withgoogle.com/models/8TsdPBMwl/";
-let model,webcam,running=false;
+let model,webcam,running=false,hands,handReady=false;
+let motionPoints=[],motionLetter="",motionUntil=0,lastMotionCheck=0;
+
 async function startCamera(){
  const b=document.getElementById("start"),s=document.getElementById("status");
- b.disabled=true;s.textContent="Loading model and camera...";
+ b.disabled=true;s.textContent="Loading model, hand tracking and camera...";
  try{
   if(!model)model=await tmImage.load(URL+"model.json",URL+"metadata.json");
-  if(!webcam){webcam=new tmImage.Webcam(320,320,true);await webcam.setup();await webcam.play();document.getElementById("camera").appendChild(webcam.canvas);}
+  if(!webcam){
+   webcam=new tmImage.Webcam(320,320,true);
+   await webcam.setup();await webcam.play();
+   document.getElementById("camera").appendChild(webcam.canvas);
+  }
+  if(!hands){
+   hands=new Hands({locateFile:(file)=>`https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`});
+   hands.setOptions({maxNumHands:1,modelComplexity:1,minDetectionConfidence:0.65,minTrackingConfidence:0.6});
+   hands.onResults(onHandResults);
+   handReady=true;
+  }
   running=true;b.textContent="CAMERA RUNNING";s.textContent="Show a hand sign!";
   requestAnimationFrame(loop);
- }catch(e){console.error(e);s.textContent="Camera could not start. Allow camera access and use an HTTPS webpage.";b.disabled=false;b.textContent="TRY AGAIN";}
+ }catch(e){
+  console.error(e);s.textContent="Camera or hand tracking could not start. Allow camera access and use the HTTPS webpage.";
+  b.disabled=false;b.textContent="TRY AGAIN";
+ }
 }
-async function loop(){if(!running)return;webcam.update();await predict();requestAnimationFrame(loop);}
+
+async function loop(){
+ if(!running)return;
+ webcam.update();
+ if(handReady){
+  try{await hands.send({image:webcam.canvas});}catch(e){console.warn("Hand tracking:",e);}
+ }
+ await predict();
+ requestAnimationFrame(loop);
+}
+
+function onHandResults(results){
+ const now=Date.now();
+ if(!results.multiHandLandmarks||!results.multiHandLandmarks.length){
+  motionPoints=[];motionLetter="";return;
+ }
+ const lm=results.multiHandLandmarks[0];
+ // MediaPipe coordinates: x increases to the right; y increases downward.
+ const indexTip=lm[8],indexPip=lm[6],pinkyTip=lm[20],pinkyPip=lm[18];
+ const indexExtended=indexTip.y<indexPip.y-0.025;
+ const pinkyExtended=pinkyTip.y<pinkyPip.y-0.025;
+ let tip=null,kind="";
+ if(pinkyExtended&&!indexExtended){tip=pinkyTip;kind="J";}
+ else if(indexExtended){tip=indexTip;kind="Z";}
+ if(!tip){motionPoints=[];return;}
+ if(!motionPoints.length||motionPoints[motionPoints.length-1].kind!==kind)motionPoints=[];
+ motionPoints.push({x:tip.x,y:tip.y,t:now,kind});
+ motionPoints=motionPoints.filter(p=>now-p.t<1100).slice(-24);
+ if(now-lastMotionCheck<120)return;
+ lastMotionCheck=now;
+ if(motionPoints.length<7)return;
+ const pts=motionPoints;
+ const first=pts[0],last=pts[pts.length-1];
+ const dx=last.x-first.x,dy=last.y-first.y;
+ const xs=pts.map(p=>p.x),ys=pts.map(p=>p.y);
+ const xRange=Math.max(...xs)-Math.min(...xs),yRange=Math.max(...ys)-Math.min(...ys);
+ if(kind==="J"){
+  // Pinky must travel a visible curved/downward path.
+  if(yRange>0.12&&Math.abs(dx)>0.07&&dy>0.06){
+   motionLetter="J";motionUntil=now+1400;motionPoints=[];
+  }
+ }else{
+  // A Z has a sideways stroke, a diagonal, then another sideways stroke.
+  let turns=0,lastSign=0;
+  for(let i=2;i<pts.length;i++){
+   const sx=Math.sign(pts[i].x-pts[i-2].x);
+   if(sx&&lastSign&&sx!==lastSign)turns++;
+   if(sx)lastSign=sx;
+  }
+  if(xRange>0.18&&yRange>0.10&&turns>=1){
+   motionLetter="Z";motionUntil=now+1400;motionPoints=[];
+  }
+ }
+}
+
 async function predict(){
- const p=await model.predict(webcam.canvas);p.sort((a,b)=>b.probability-a.probability);
- const best=p[0];document.getElementById("letter").textContent=best.className;
- document.getElementById("confidence").textContent=Math.round(best.probability*100)+"% confidence";
- if(window.AppInventor&&window.AppInventor.setWebViewString)window.AppInventor.setWebViewString(best.className);
+ const now=Date.now();
+ if(motionLetter&&now<motionUntil){
+  showLetter(motionLetter,"Movement detected");
+  sendToApp(motionLetter);
+  return;
+ }
+ const p=await model.predict(webcam.canvas);
+ p.sort((a,b)=>b.probability-a.probability);
+ const best=p[0];
+ showLetter(best.className,Math.round(best.probability*100)+"% confidence");
+ sendToApp(best.className);
+}
+function showLetter(letter,confidence){
+ document.getElementById("letter").textContent=letter;
+ document.getElementById("confidence").textContent=confidence;
+}
+function sendToApp(letter){
+ if(window.AppInventor&&window.AppInventor.setWebViewString)
+  window.AppInventor.setWebViewString(letter);
 }
 </script></main></body></html>
+
